@@ -7,6 +7,9 @@
 (define-constant ERR_BUDGET_EXCEEDED (err u105))
 (define-constant ERR_INVALID_BUDGET (err u106))
 (define-constant ERR_BUDGET_NOT_FOUND (err u107))
+(define-constant ERR_COMPLIANCE_NOT_FOUND (err u108))
+(define-constant ERR_INVALID_SCORE (err u109))
+(define-constant ERR_AUDIT_NOT_FOUND (err u110))
 
 (define-data-var next-tax-id uint u1)
 (define-data-var next-allocation-id uint u1)
@@ -98,6 +101,59 @@
 )
 
 (define-data-var next-alert-id uint u1)
+(define-data-var next-compliance-id uint u1)
+(define-data-var next-audit-id uint u1)
+(define-data-var next-violation-id uint u1)
+
+;; Compliance audit trail maps
+(define-map compliance-records
+  { compliance-id: uint }
+  {
+    authority-id: uint,
+    compliance-score: uint,
+    assessment-date: uint,
+    assessed-by: principal,
+    status: (string-ascii 20),
+    notes: (string-ascii 300)
+  }
+)
+
+(define-map compliance-violations
+  { violation-id: uint }
+  {
+    authority-id: uint,
+    violation-type: (string-ascii 50),
+    severity: (string-ascii 10),
+    description: (string-ascii 400),
+    penalty-amount: uint,
+    detected-at: uint,
+    resolved: bool,
+    resolution-date: (optional uint)
+  }
+)
+
+(define-map audit-trail
+  { audit-id: uint }
+  {
+    authority-id: uint,
+    action-type: (string-ascii 30),
+    action-data: (string-ascii 200),
+    auditor: principal,
+    audit-timestamp: uint,
+    related-record-id: uint
+  }
+)
+
+(define-map authority-compliance-summary
+  { authority-id: uint }
+  {
+    current-score: uint,
+    total-violations: uint,
+    resolved-violations: uint,
+    last-audit-date: uint,
+    compliance-status: (string-ascii 20)
+  }
+)
 
 (define-read-only (get-tax-authority (authority-id uint))
   (map-get? tax-authorities { authority-id: authority-id })
@@ -148,6 +204,35 @@
 
 (define-read-only (get-next-alert-id)
   (var-get next-alert-id)
+)
+
+;; Compliance read-only functions
+(define-read-only (get-compliance-record (compliance-id uint))
+  (map-get? compliance-records { compliance-id: compliance-id })
+)
+
+(define-read-only (get-compliance-violation (violation-id uint))
+  (map-get? compliance-violations { violation-id: violation-id })
+)
+
+(define-read-only (get-audit-record (audit-id uint))
+  (map-get? audit-trail { audit-id: audit-id })
+)
+
+(define-read-only (get-authority-compliance-summary (authority-id uint))
+  (map-get? authority-compliance-summary { authority-id: authority-id })
+)
+
+(define-read-only (get-next-compliance-id)
+  (var-get next-compliance-id)
+)
+
+(define-read-only (get-next-audit-id)
+  (var-get next-audit-id)
+)
+
+(define-read-only (get-next-violation-id)
+  (var-get next-violation-id)
 )
 
 (define-public (register-tax-authority (name (string-ascii 50)) (wallet principal))
@@ -459,3 +544,195 @@
     )
   )
 )
+
+;; Compliance audit trail functions
+(define-public (create-compliance-assessment (authority-id uint) (compliance-score uint) (status (string-ascii 20)) (notes (string-ascii 300)))
+  (let 
+    (
+      (compliance-id (var-get next-compliance-id))
+      (authority (unwrap! (map-get? tax-authorities { authority-id: authority-id }) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= compliance-score u100) ERR_INVALID_SCORE)
+    (asserts! (get active authority) ERR_NOT_FOUND)
+    (map-set compliance-records
+      { compliance-id: compliance-id }
+      {
+        authority-id: authority-id,
+        compliance-score: compliance-score,
+        assessment-date: stacks-block-height,
+        assessed-by: tx-sender,
+        status: status,
+        notes: notes
+      }
+    )
+    (unwrap-panic (update-compliance-summary authority-id compliance-score))
+    (unwrap-panic (log-audit-action authority-id "compliance_assessment" "Compliance assessment created" compliance-id))
+    (var-set next-compliance-id (+ compliance-id u1))
+    (ok compliance-id)
+  )
+)
+
+(define-public (record-compliance-violation (authority-id uint) (violation-type (string-ascii 50)) (severity (string-ascii 10)) (description (string-ascii 400)) (penalty-amount uint))
+  (let 
+    (
+      (violation-id (var-get next-violation-id))
+      (authority (unwrap! (map-get? tax-authorities { authority-id: authority-id }) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get active authority) ERR_NOT_FOUND)
+    (map-set compliance-violations
+      { violation-id: violation-id }
+      {
+        authority-id: authority-id,
+        violation-type: violation-type,
+        severity: severity,
+        description: description,
+        penalty-amount: penalty-amount,
+        detected-at: stacks-block-height,
+        resolved: false,
+        resolution-date: none
+      }
+    )
+    (unwrap-panic (increment-violation-count authority-id))
+    (unwrap-panic (log-audit-action authority-id "violation_recorded" "Compliance violation recorded" violation-id))
+    (var-set next-violation-id (+ violation-id u1))
+    (ok violation-id)
+  )
+)
+
+(define-public (resolve-compliance-violation (violation-id uint))
+  (let 
+    (
+      (violation (unwrap! (map-get? compliance-violations { violation-id: violation-id }) ERR_NOT_FOUND))
+      (authority-id (get authority-id violation))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (get resolved violation)) ERR_ALREADY_EXISTS)
+    (map-set compliance-violations
+      { violation-id: violation-id }
+      (merge violation { resolved: true, resolution-date: (some stacks-block-height) })
+    )
+    (unwrap-panic (increment-resolved-violation-count authority-id))
+    (unwrap-panic (log-audit-action authority-id "violation_resolved" "Violation marked as resolved" violation-id))
+    (ok true)
+  )
+)
+
+(define-public (update-compliance-status (authority-id uint) (new-status (string-ascii 20)))
+  (let 
+    (
+      (authority (unwrap! (map-get? tax-authorities { authority-id: authority-id }) ERR_NOT_FOUND))
+      (current-summary (default-to 
+        { current-score: u0, total-violations: u0, resolved-violations: u0, last-audit-date: u0, compliance-status: "pending" }
+        (map-get? authority-compliance-summary { authority-id: authority-id })
+      ))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get active authority) ERR_NOT_FOUND)
+    (map-set authority-compliance-summary
+      { authority-id: authority-id }
+      (merge current-summary { compliance-status: new-status, last-audit-date: stacks-block-height })
+    )
+    (unwrap-panic (log-audit-action authority-id "status_updated" new-status u0))
+    (ok true)
+  )
+)
+
+(define-private (update-compliance-summary (authority-id uint) (new-score uint))
+  (let 
+    (
+      (current-summary (default-to 
+        { current-score: u0, total-violations: u0, resolved-violations: u0, last-audit-date: u0, compliance-status: "pending" }
+        (map-get? authority-compliance-summary { authority-id: authority-id })
+      ))
+    )
+    (map-set authority-compliance-summary
+      { authority-id: authority-id }
+      (merge current-summary { current-score: new-score, last-audit-date: stacks-block-height })
+    )
+    (ok true)
+  )
+)
+
+(define-private (increment-violation-count (authority-id uint))
+  (let 
+    (
+      (current-summary (default-to 
+        { current-score: u0, total-violations: u0, resolved-violations: u0, last-audit-date: u0, compliance-status: "pending" }
+        (map-get? authority-compliance-summary { authority-id: authority-id })
+      ))
+      (new-total (+ (get total-violations current-summary) u1))
+    )
+    (map-set authority-compliance-summary
+      { authority-id: authority-id }
+      (merge current-summary { total-violations: new-total })
+    )
+    (ok true)
+  )
+)
+
+(define-private (increment-resolved-violation-count (authority-id uint))
+  (let 
+    (
+      (current-summary (default-to 
+        { current-score: u0, total-violations: u0, resolved-violations: u0, last-audit-date: u0, compliance-status: "pending" }
+        (map-get? authority-compliance-summary { authority-id: authority-id })
+      ))
+      (new-resolved (+ (get resolved-violations current-summary) u1))
+    )
+    (map-set authority-compliance-summary
+      { authority-id: authority-id }
+      (merge current-summary { resolved-violations: new-resolved })
+    )
+    (ok true)
+  )
+)
+
+(define-private (log-audit-action (authority-id uint) (action-type (string-ascii 30)) (action-data (string-ascii 200)) (related-id uint))
+  (let ((audit-id (var-get next-audit-id)))
+    (map-set audit-trail
+      { audit-id: audit-id }
+      {
+        authority-id: authority-id,
+        action-type: action-type,
+        action-data: action-data,
+        auditor: tx-sender,
+        audit-timestamp: stacks-block-height,
+        related-record-id: related-id
+      }
+    )
+    (var-set next-audit-id (+ audit-id u1))
+    (ok audit-id)
+  )
+)
+
+(define-read-only (calculate-compliance-health (authority-id uint))
+  (let 
+    (
+      (summary (map-get? authority-compliance-summary { authority-id: authority-id }))
+    )
+    (match summary
+      compliance-data
+        (let 
+          (
+            (score (get current-score compliance-data))
+            (total-violations (get total-violations compliance-data))
+            (resolved-violations (get resolved-violations compliance-data))
+            (unresolved-violations (- total-violations resolved-violations))
+            (resolution-rate (if (> total-violations u0) (/ (* resolved-violations u100) total-violations) u0))
+          )
+          (ok { 
+            health-score: score,
+            resolution-rate: resolution-rate,
+            unresolved-violations: unresolved-violations,
+            risk-level: (if (and (> score u80) (< unresolved-violations u3)) "low" 
+                          (if (and (> score u60) (< unresolved-violations u6)) "medium" "high"))
+          })
+        )
+      ERR_COMPLIANCE_NOT_FOUND
+    )
+  )
+)
+
+
